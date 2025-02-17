@@ -35,7 +35,6 @@ def get_embedding(text: str):
     """
     text = text.replace("\n", " ")
     embedding = openai.Client().embeddings.create(input=[text], model=embedding_model).data[0].embedding
-    logger.info(f"Embedding: {embedding}")
     return embedding
 
 
@@ -80,7 +79,13 @@ def create_and_populate_chroma(df: pd.DataFrame, collection_name: str, persist_p
         chroma_client.delete_collection(name=collection_name)
 
     logger.info(f"Creating new collection '{collection_name}'.")
-    collection = chroma_client.create_collection(name=collection_name)
+    collection = chroma_client.create_collection(
+        name=collection_name,
+        metadata={
+            "hnsw:space": "cosine",
+            "hnsw:search_ef": 100
+        }
+    )
 
 
     # We'll parse the "embedding_long" column as lists (it might be JSON strings).
@@ -142,28 +147,34 @@ def create_and_populate_chroma(df: pd.DataFrame, collection_name: str, persist_p
 # 4) Query Function
 ##################################
 
-def query_chroma(query_text: str, collection_name: str, top_n: int = 200, persist_path: str = "chroma_data") -> pd.DataFrame:
+def query_chroma(query_text: str, collection_name: str, similarity_threshold: float = 0.2, initial_top_n: int = 5500, persist_path: str = "chroma_data") -> pd.DataFrame:
     """
-    1) Generate a 1536D embedding for 'query_text' using OpenAI.
-    2) Query the persistent Chroma DB for top_n results.
-    3) Return a DataFrame WITHOUT the large embeddings,
-       but keep 'embedding_short' in metadata (JSON string). We'll parse it
-       and rename it to 'embedding' to avoid confusion.
+    Query the ChromaDB collection to retrieve all results above a certain similarity threshold.
+
+    Args:
+        query_text (str): The text to query.
+        collection_name (str): The name of the collection to query.
+        similarity_threshold (float): The similarity threshold (0 to 1) to filter results.
+        initial_top_n (int): The initial number of top results to retrieve before filtering.
+        persist_path (str): The path to the persistent ChromaDB.
+
+    Returns:
+        pd.DataFrame: DataFrame containing the filtered results.
     """
-    logger.info(f"Embedding query text with model '{embedding_model}': {query_text[:60]}...")
+    logger.info(f"Embedding query text: {query_text[:60]}")
     query_vector = get_embedding(query_text)
 
-    logger.info("Connecting to the persistent Chroma DB for querying.")
-    # Load from the same `persist_path` to see the existing data
+    logger.info("Connecting to Chroma DB.")
     chroma_client = chromadb.PersistentClient(path=persist_path)
 
     logger.info(f"Retrieving collection '{collection_name}'.")
     collection = chroma_client.get_collection(name=collection_name)
 
-    logger.info(f"Querying top {top_n} results from '{collection_name}'.")
+    logger.info(f"Querying top {initial_top_n} results from '{collection_name}'.")
     results = collection.query(
+
         query_embeddings=[query_vector],
-        n_results=top_n,
+        n_results=initial_top_n,
         include=["distances", "documents", "metadatas"]
     )
 
@@ -173,16 +184,33 @@ def query_chroma(query_text: str, collection_name: str, top_n: int = 200, persis
     documents = results["documents"][0]
     metadatas = results["metadatas"][0]
 
-    logger.info(f"Received {len(ids)} results.")
+    logger.info(f"Received {len(ids)} results. Filtering based on similarity threshold.")
+
+    # Filter results based on the similarity threshold
+    filtered_data = [
+        (id_, dist, doc, meta) for id_, dist, doc, meta in zip(ids, distances, documents, metadatas)
+        if dist <= similarity_threshold
+    ]
+
+    if not filtered_data:
+        logger.info("No results found above the similarity threshold.")
+        return pd.DataFrame()  # Return an empty DataFrame if no results match the threshold
+
+    # Unzip the filtered data
+    filtered_ids, filtered_distances, filtered_documents, filtered_metadatas = zip(*filtered_data)
 
     # Build a DataFrame
-    df_out = pd.DataFrame({"id": ids, "distance": distances, "document": documents})
+    df_out = pd.DataFrame({
+        "id": filtered_ids,
+        "distance": filtered_distances,
+        "document": filtered_documents
+    })
 
     # Expand metadata
-    df_meta = pd.json_normalize(metadatas)
+    df_meta = pd.json_normalize(filtered_metadatas)
     df_final = pd.concat([df_out, df_meta], axis=1)
 
-    # If for some reason 'embedding_long' got included (it shouldn't), drop it
+    # Drop 'embedding_long' if it exists
     if "embedding_long" in df_final.columns:
         df_final.drop(columns=["embedding_long"], inplace=True)
 
@@ -193,6 +221,7 @@ def query_chroma(query_text: str, collection_name: str, top_n: int = 200, persis
         )
         df_final.rename(columns={"embedding_short": "embedding"}, inplace=True)
 
+    logger.info(f"Filtered results count: {len(df_final)}")
     return df_final
 
 
@@ -208,20 +237,39 @@ if __name__ == "__main__":
 
     logger.info("Starting script...")
 
-    # # 1) Load your DataFrame
-    # df = load_data(csv_path)
-    #
-    # # 2) Populate the persistent Chroma DB with the 1536D embeddings
-    # create_and_populate_chroma(df, collection_name, persist_path=persist_dir)
+    # 1) Load your DataFrame
+    df = load_data(csv_path)
+
+    # 2) Populate the persistent Chroma DB with the 1536D embeddings
+    create_and_populate_chroma(df, collection_name, persist_path=persist_dir)
 
     # 3) Query the database with some text
-    query_text = "People are happy with the gameplay experience"
-    results_df = query_chroma(query_text, collection_name, top_n=200, persist_path=persist_dir)
+    query_text = "Breeding of Horses"
+    # Define a similarity threshold (adjust as needed)
+    similarity_threshold = 1.3
 
-    logger.info("Query returned a DataFrame with %d rows.", len(results_df))
-    logger.info("Head of the results:\n%s", results_df.head(10).to_string())
+    # Query the database with the similarity threshold instead of top_n
+    results_df = query_chroma(query_text, collection_name, similarity_threshold=similarity_threshold,
+                              persist_path=persist_dir)
+
+    # Logger statement for the number of retrieved entries
+    retrieved_count = len(results_df)
+    logger.info("Query returned %d entries with similarity threshold ≤ %.2f.", retrieved_count, similarity_threshold)
+
+    # Display the first 10 results if available
+    if not results_df.empty:
+        logger.info("Head of the results:\n%s", results_df.head(10).to_string())
+    else:
+        logger.info("No results found matching the similarity threshold.")
 
     # Possibly save the results
     results_df.to_pickle("query_results.pkl")
+
+    print("Preview of the resulting DataFrame:")
+    print(results_df.head())
+
+    results_df.sort_values(by="distance", ascending=True, inplace=False)
+    print(f'top 5 results {results_df.sort_values(by="distance", ascending=True, inplace=False)[["distance", "document"]].head()} top bottom five {results_df.sort_values(by="distance", ascending=True, inplace=False)[["distance", "document"]].tail()}')
+
 
     logger.info("Done.")
