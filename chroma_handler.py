@@ -71,63 +71,62 @@ def prepare_dataframe(
 
 
 #region 1 Chroma interaction
+
 def upsert_chroma_data(
-        df: pd.DataFrame,
-        collection_name: str,
-        persist_path: str = "chroma_data",
-        batch_size: int = 100
+    df: pd.DataFrame,
+    collection_name: str,
+    persist_path: str = "chroma_data",
+    batch_size: int = 100
 ) -> None:
     """
-    This function either creates the Chroma collection (if it doesn't exist)
-    or retrieves it (if it does). It then:
-      1. If the collection already existed, deletes rows matching the IDs in `df["pp_id"]`
-      2. Adds (inserts) the new data in batches
-    Ensuring NO duplicates.
+    Upsert data into Chroma without duplicates:
+      1) If the collection doesn't exist, create it and insert ALL rows.
+      2) If it does exist, skip any IDs that are already there, and insert only new rows.
+         (No duplicates, no warnings).
+
+    DataFrame columns:
+      - 'pp_id' (unique ID for each row)
+      - 'embedding' (list of floats or JSON string)
+      - 'sentence' (optional; will be stored as 'documents')
+      - plus other columns for metadata
 
     Args:
-        df (pd.DataFrame): DataFrame containing columns:
-            - "pp_id" (unique ID for each row)
-            - "embedding" (list of floats or JSON string)
-            - "sentence" (optional; stored as the 'documents' in Chroma)
-            - plus other metadata columns
-        collection_name (str): Name of the collection to create or retrieve.
-        persist_path (str): Folder path for the persistent Chroma DB.
+        df (pd.DataFrame): Data with 'pp_id' and 'embedding' columns (and optional 'sentence').
+        collection_name (str): The name of the Chroma collection.
+        persist_path (str): Folder path for persistent Chroma storage.
         batch_size (int): Number of rows to insert per batch (default=100).
     """
-
-    # 1) Connect to (or create) the persistent Chroma client
     logger.info("Initializing persistent Chroma client via `PersistentClient`.")
     chroma_client = chromadb.PersistentClient(path=persist_path)
 
+    # 1) Check if collection exists
     existing_collections = chroma_client.list_collections()
+    collection_exists = (collection_name in existing_collections)
 
-    # 2) Either retrieve the existing collection OR create a new one
-    newly_created = False
-    if collection_name in existing_collections:
-        logger.info(f"Collection '{collection_name}' exists. Retrieving it.")
-        collection = chroma_client.get_collection(name=collection_name)
-    else:
-        logger.info(f"Collection '{collection_name}' does not exist. Creating a new one.")
+    # 2) Create or get collection
+    if not collection_exists:
+        logger.info(f"Collection '{collection_name}' does NOT exist. Creating new collection.")
         collection = chroma_client.create_collection(
             name=collection_name,
             metadata={"hnsw:space": "cosine", "hnsw:search_ef": 100}
         )
-        newly_created = True
+    else:
+        logger.info(f"Collection '{collection_name}' already exists. Retrieving it.")
+        collection = chroma_client.get_collection(name=collection_name)
 
-    # 3) Convert the "embedding" column to lists of floats (if stored as JSON strings)
+    # 3) Ensure 'embedding' is a list of floats
     def ensure_list(val):
         if isinstance(val, str):
-            return json.loads(val)  # e.g. "[0.123, 0.456]" -> Python list
+            return json.loads(val)  # e.g. "[0.123, 0.456]" -> [0.123, 0.456]
         return val
 
-    logger.info("Ensuring 'embedding' column is a list of floats.")
     df["embedding"] = df["embedding"].apply(ensure_list)
 
-    # Prepare data
+    # 4) Prepare all IDs, embeddings, etc.
     all_ids = df["pp_id"].astype(str).tolist()
     all_embeddings = df["embedding"].tolist()
 
-    # If there's a "sentence" column, store it as the 'documents'
+    # If there's a 'sentence' column, use it for documents; otherwise use empty strings
     documents = (
         df["sentence"].fillna("").astype(str).tolist()
         if "sentence" in df.columns else [""] * len(df)
@@ -137,42 +136,89 @@ def upsert_chroma_data(
     exclude_cols = {"pp_id", "embedding"}
     meta_columns = [col for col in df.columns if col not in exclude_cols]
 
-    # Convert each row of metadata to a dict
     metadatas = []
     for _, row in df.iterrows():
         meta = {}
         for col in meta_columns:
             val = row[col]
+            # If it's a list, store it as JSON
             if isinstance(val, list):
-                val = json.dumps(val)  # store list-like data as a JSON string
+                val = json.dumps(val)
             meta[col] = val
         metadatas.append(meta)
 
-    # 4) Only if the collection already existed, delete any existing IDs first
-    if not newly_created:
-        logger.info(f"Deleting any existing items with these {len(all_ids)} IDs (collection was not newly created).")
-        if all_ids:
-            collection.delete(ids=all_ids)
+    # 5) If collection already existed, figure out which IDs are new
+    if collection_exists:
+        logger.info(f"Checking which of the {len(all_ids)} IDs already exist in the collection.")
+        # Query the DB for these IDs (include=[] means we don't fetch documents, embeddings, etc.)
+        existing_data = collection.get(ids=all_ids, include=[])
+        found_ids = set(existing_data["ids"]) if existing_data["ids"] else set()
 
-    # 5) Insert new items in batches
-    num_rows = len(df)
-    logger.info(f"Inserting {num_rows} rows into '{collection_name}' in batches of {batch_size}.")
-    for start_idx in range(0, num_rows, batch_size):
+        # Filter out the rows whose IDs are already in the collection
+        new_ids = []
+        new_embeddings = []
+        new_docs = []
+        new_metas = []
+        for i, pid in enumerate(all_ids):
+            if pid not in found_ids:
+                new_ids.append(pid)
+                new_embeddings.append(all_embeddings[i])
+                new_docs.append(documents[i])
+                new_metas.append(metadatas[i])
+
+        # If no new rows, we're done
+        if not new_ids:
+            logger.info("All IDs already exist in the collection. No new data to insert.")
+            return
+
+        logger.info(f"{len(found_ids)} IDs already existed, {len(new_ids)} are new. Inserting only the new ones.")
+        # Insert new items in batches
+        _insert_in_batches(
+            collection,
+            new_ids,
+            new_embeddings,
+            new_docs,
+            new_metas,
+            batch_size,
+            collection_name
+        )
+
+    else:
+        # Collection is newly created, so everything in df is new
+        logger.info(f"Collection is new. Inserting all {len(df)} rows.")
+        _insert_in_batches(
+            collection,
+            all_ids,
+            all_embeddings,
+            documents,
+            metadatas,
+            batch_size,
+            collection_name
+        )
+
+    logger.info(f"Upsert complete. Collection '{collection_name}' updated with no duplicates.")
+
+
+def _insert_in_batches(collection, ids, embeddings, documents, metadatas, batch_size, collection_name):
+    """
+    Helper to insert data in batches into a Chroma collection.
+    """
+    total = len(ids)
+    for start_idx in range(0, total, batch_size):
         end_idx = start_idx + batch_size
-        sub_ids = all_ids[start_idx:end_idx]
-        sub_embeddings = all_embeddings[start_idx:end_idx]
+        sub_ids = ids[start_idx:end_idx]
+        sub_emb = embeddings[start_idx:end_idx]
         sub_docs = documents[start_idx:end_idx]
         sub_metas = metadatas[start_idx:end_idx]
 
         collection.add(
             ids=sub_ids,
-            embeddings=sub_embeddings,
+            embeddings=sub_emb,
             documents=sub_docs,
             metadatas=sub_metas
         )
-        logger.info(f"Inserted rows {start_idx} to {end_idx - 1}.")
+        logging.info(f"Inserted rows {start_idx} to {end_idx - 1} into '{collection_name}'.")
 
-    logger.info(f"Upsert operation complete. Collection '{collection_name}' updated with no duplicates.")
 
 
 # Function for querying the ChromaDB and returning the results
@@ -181,7 +227,7 @@ def query_chroma(
     query_text: str,
     collection_name: str,
     similarity_threshold: float = 0.54,
-    initial_top_n: int = 5500,
+    initial_top_n: int = 999999999,         # probably just setting this to a high number is fine as long as the dataset is not too big
     persist_path: str = "chroma_data",
     where_filters: dict = None  # <--- new argument
 ) -> pd.DataFrame:
