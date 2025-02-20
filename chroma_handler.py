@@ -1,16 +1,15 @@
 import os
 import json
 import pandas as pd
-import numpy as np
+
 import logging
 import openai
 
+
 import chromadb
-from chromadb.config import Settings
-from chromadb import PersistentClient
 from dotenv import load_dotenv
 
-# 0) Setup Logging
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -19,7 +18,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.ERROR)  # Suppress API HTTP request logs
 
 ######################
-# 0) Environment Setup
+# 0) Helper functions
 ######################
 
 load_dotenv()  # Loads environment variables from .env if present
@@ -28,6 +27,7 @@ logger.info("Environment variables loaded.")
 embedding_model = "text-embedding-3-small"
 
 
+# This helper converts the query into an embedding using OpenAI's API
 def get_embedding(text: str):
     """
     Your unmodified embedding function.
@@ -38,33 +38,10 @@ def get_embedding(text: str):
     return embedding
 
 
-###############################
-# 2) Load & Prepare CSV / PKL
-###############################
-
-def load_data(csv_path: str) -> pd.DataFrame:
-    """
-    Load your DataFrame from a .pkl (or CSV, as you have in your script).
-    Expects columns:
-      - 'id'
-      - 'embedding_long' (1536D)
-      - 'embedding_short' (25D)
-      - 'sentence' (optional)
-      - plus other metadata...
-    """
-    logger.info(f"Loading DataFrame from: {csv_path}")
-    df = pd.read_pickle(csv_path)  # or read_csv if that's actually what you have
-    logger.info(f"DataFrame loaded with {len(df)} rows.")
-    return df
-
-
-##################################
-# 3) Create & Populate Chroma DB
-##################################
-
+# 1 Function for creating and populating the ChromaDB and a collection
 def create_and_populate_chroma(df: pd.DataFrame, collection_name: str, persist_path: str = "chroma_data") -> None:
     """
-    Creates (or overwrites) a local persistent Chroma collection using `embedding_long` (1536D) as vectors.
+    Creates (or overwrites) a local persistent Chroma collection using `embedding` (1536D) as vectors.
     `embedding_short` is stored as JSON in the metadata to avoid Chroma's scalar-only metadata restriction.
     """
 
@@ -78,6 +55,7 @@ def create_and_populate_chroma(df: pd.DataFrame, collection_name: str, persist_p
         logger.info(f"Collection '{collection_name}' already exists. Deleting it.")
         chroma_client.delete_collection(name=collection_name)
 
+    # Create new collection (Cosine similarity)
     logger.info(f"Creating new collection '{collection_name}'.")
     collection = chroma_client.create_collection(
         name=collection_name,
@@ -88,24 +66,101 @@ def create_and_populate_chroma(df: pd.DataFrame, collection_name: str, persist_p
     )
 
 
-    # We'll parse the "embedding_long" column as lists (it might be JSON strings).
+    # We'll parse the "embedding" column as lists (it might be JSON strings).
     def ensure_list(val):
         if isinstance(val, str):
             return json.loads(val)  # e.g. "[0.123, 0.456, ...]" -> Python list
         return val
 
-    logger.info("Converting embedding_long values to Python lists.")
-    df["embedding_long"] = df["embedding_long"].apply(ensure_list)
+    logger.info("Converting embedding values to Python lists.")
+    df["embedding"] = df["embedding"].apply(ensure_list)
 
     # Prepare data for insertion
-    all_ids = df["id"].astype(str).tolist()
-    all_embeddings = df["embedding_long"].tolist()
+    all_ids = df["pp_id"].astype(str).tolist()
+    all_embeddings = df["embedding"].tolist()
 
     # If you want to store a text column as 'documents', e.g. "sentence":
     documents = df["sentence"].fillna("").astype(str).tolist() if "sentence" in df.columns else [""] * len(df)
 
-    # Build metadata. We'll exclude 'embedding_long' to avoid big vectors in metadata.
-    exclude_cols = {"id", "embedding_long"}
+    # Build metadata. We'll exclude 'embedding' to avoid big vectors in metadata.
+    exclude_cols = {"pp_id", "embedding"}
+    meta_columns = [col for col in df.columns if col not in exclude_cols]
+
+    metadatas = []
+    for _, row in df.iterrows():
+        meta = {}
+        for col in meta_columns:
+            val = row[col]
+            # If it's a list (like embedding_short), convert to JSON string
+            if isinstance(val, list):
+                val = json.dumps(val)
+            meta[col] = val
+        metadatas.append(meta)
+
+    # logger.info(f"Metadata {metadatas}")
+    # logger.info(type(metadatas))
+    # logger.info(f"Metadata {metadatas[0]}")
+
+    # Insert in batches
+    batch_size = 100
+    num_rows = len(df)
+    logger.info(f"Inserting {num_rows} rows into '{collection_name}' in batches of {batch_size}.")
+
+    for start_idx in range(0, num_rows, batch_size):
+        end_idx = start_idx + batch_size
+        sub_ids = all_ids[start_idx:end_idx]
+        sub_embeddings = all_embeddings[start_idx:end_idx]
+        sub_docs = documents[start_idx:end_idx]
+        sub_metas = metadatas[start_idx:end_idx]
+
+        collection.add(
+            ids=sub_ids,
+            embeddings=sub_embeddings,
+            documents=sub_docs,
+            metadatas=sub_metas
+        )
+        logger.info(f"Inserted rows {start_idx} to {end_idx - 1} into the collection.")
+
+    logger.info(f"Collection '{collection_name}' successfully created and populated at '{persist_path}'. ")
+
+
+
+# 2 Function for adding new Data to the existing ChromaDB and collection
+
+def add_data_to_chroma(df: pd.DataFrame, collection_name: str, persist_path: str = "chroma_data") -> None:
+    """
+    Adds new data to an existing Chroma collection.
+    """
+    logger.info("Initializing persistent Chroma client via `PersistentClient`.")
+    chroma_client = chromadb.PersistentClient(path=persist_path)
+
+    # Check if the collection exists
+    existing = chroma_client.list_collections()  # returns a list of collection names in v0.6.0
+    if collection_name not in existing:
+        logger.error(f"Collection '{collection_name}' does not exist. Please create it first.")
+        return
+
+    logger.info(f"Retrieving existing collection '{collection_name}'.")
+    collection = chroma_client.get_collection(name=collection_name)
+
+    # We'll parse the "embedding" column as lists (it might be JSON strings).
+    def ensure_list(val):
+        if isinstance(val, str):
+            return json.loads(val)  # e.g. "[0.123, 0.456, ...]" -> Python list
+        return val
+
+    logger.info("Converting embedding values to Python lists.")
+    df["embedding"] = df["embedding"].apply(ensure_list)
+
+    # Prepare data for insertion
+    all_ids = df["pp_id"].astype(str).tolist()
+    all_embeddings = df["embedding"].tolist()
+
+    # If you want to store a text column as 'documents', e.g. "sentence":
+    documents = df["sentence"].fillna("").astype(str).tolist() if "sentence" in df.columns else [""] * len(df)
+
+    # Build metadata. We'll exclude 'embedding' to avoid big vectors in metadata.
+    exclude_cols = {"pp_id", "embedding"}
     meta_columns = [col for col in df.columns if col not in exclude_cols]
 
     metadatas = []
@@ -139,14 +194,11 @@ def create_and_populate_chroma(df: pd.DataFrame, collection_name: str, persist_p
         )
         logger.info(f"Inserted rows {start_idx} to {end_idx - 1} into the collection.")
 
-    logger.info(f"Collection '{collection_name}' successfully created and populated at '{persist_path}'. "
-                "You can reuse it in future runs without re-inserting.")
+    logger.info(f"Data successfully added to collection '{collection_name}'.")
 
 
-##################################
-# 4) Query Function
-##################################
 
+# 3 Function for querying the ChromaDB and returning the results
 def query_chroma(query_text: str, collection_name: str, similarity_threshold: float = 0.2, initial_top_n: int = 5500, persist_path: str = "chroma_data") -> pd.DataFrame:
     """
     Query the ChromaDB collection to retrieve all results above a certain similarity threshold.
@@ -161,7 +213,7 @@ def query_chroma(query_text: str, collection_name: str, similarity_threshold: fl
     Returns:
         pd.DataFrame: DataFrame containing the filtered results.
     """
-    logger.info(f"Embedding query text: {query_text[:60]}")
+
     query_vector = get_embedding(query_text)
 
     logger.info("Connecting to Chroma DB.")
@@ -170,7 +222,6 @@ def query_chroma(query_text: str, collection_name: str, similarity_threshold: fl
     logger.info(f"Retrieving collection '{collection_name}'.")
     collection = chroma_client.get_collection(name=collection_name)
 
-    logger.info(f"Querying top {initial_top_n} results from '{collection_name}'.")
     results = collection.query(
 
         query_embeddings=[query_vector],
@@ -201,7 +252,7 @@ def query_chroma(query_text: str, collection_name: str, similarity_threshold: fl
 
     # Build a DataFrame
     df_out = pd.DataFrame({
-        "id": filtered_ids,
+        "pp_id": filtered_ids,
         "distance": filtered_distances,
         "document": filtered_documents
     })
@@ -210,9 +261,9 @@ def query_chroma(query_text: str, collection_name: str, similarity_threshold: fl
     df_meta = pd.json_normalize(filtered_metadatas)
     df_final = pd.concat([df_out, df_meta], axis=1)
 
-    # Drop 'embedding_long' if it exists
-    if "embedding_long" in df_final.columns:
-        df_final.drop(columns=["embedding_long"], inplace=True)
+    # Drop 'embedding' if it exists
+    if "embedding" in df_final.columns:
+        df_final.drop(columns=["embedding"], inplace=True)
 
     # Parse 'embedding_short' from JSON, rename to 'embedding'
     if "embedding_short" in df_final.columns:
@@ -225,20 +276,54 @@ def query_chroma(query_text: str, collection_name: str, similarity_threshold: fl
     return df_final
 
 
+# 4 Function to prepare the data
+def prepare_dataframe(
+    data_source: str,
+    input_json_path: str,
+    output_csv_path: str = None
+) -> pd.DataFrame:
+    """
+    1) Load JSON data into a Pandas DataFrame.
+    2) Rename 'embedding' -> 'embedding'.
+    3) Reduce embedding dimensions to 25 via UMAP, save as 'embedding_short'.
+    4) Generate ID: 'steam_1', 'steam_2', ...
+    5) (Optional) Write the resulting DataFrame to a CSV file.
+    """
+
+    # 1) Load JSON data
+    with open(input_json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)  # data is expected to be a list of dicts
+
+    df = pd.DataFrame(data)
+
+
+    # 2) Generate an incremental ID: steam_1, steam_2, ...
+    df["pp_id"] = [f"{data_source}_{i+1}" for i in range(len(df))]
+
+    # Optionally write to CSV
+    if output_csv_path:
+        df.to_csv(output_csv_path, index=False)
+
+    # Fill NaN values with empty strings
+    df = df.fillna("")
+    return df
+
+
+
 ######################
 # 5) Main / Example
 ######################
 
 if __name__ == "__main__":
     # Adjust path and collection name as needed
-    csv_path = r"S:\SID\Analytics\Working Files\Individual\Florian\Projects\semantic_search\Data\db_embedded_prepared.csv"
-    collection_name = "my_collection_1536"
-    persist_dir = "S:\SID\Analytics\Working Files\Individual\Florian\Projects\semantic_search\Data\ChromaDB"  # folder name for storing the persistent DB
+    input_path = r'S:\SID\Analytics\Working Files\Individual\Florian\Projects\semantic_search\Database\Backup\Google Play\db_embedded.json'
+    collection_name = "TestBVBb"
+    persist_dir = "S:\SID\Analytics\Working Files\Individual\Florian\Projects\semantic_search\Database\ChromaDB"  # folder name for storing the persistent DB
 
     logger.info("Starting script...")
 
     # 1) Load your DataFrame
-    df = load_data(csv_path)
+    df = prepare_dataframe(input_path, output_csv_path=None)  # No output path = no CSV is going to be saved
 
     # 2) Populate the persistent Chroma DB with the 1536D embeddings
     create_and_populate_chroma(df, collection_name, persist_path=persist_dir)
